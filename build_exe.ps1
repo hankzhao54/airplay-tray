@@ -6,7 +6,9 @@ if (-not (Test-Path $py)) {
     exit 1
 }
 $mode = if ($Console) { '--console' } else { '--windowed' }
+& $py (Join-Path $root 'make_ico.py')
 & $py -m PyInstaller --noconfirm --onefile $mode --name AirPlayTray `
+  --icon (Join-Path $root 'build\icon.ico') `
   --collect-all pyatv `
   --collect-all zeroconf `
   --collect-all soundcard `

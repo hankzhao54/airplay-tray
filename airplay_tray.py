@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 REPO_URL = "https://github.com/bleidzen/airplay-tray"
 DEFAULT_VOLUME = 30
 CONFIG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
@@ -467,14 +467,17 @@ def save_config(d):
 
 
 # ----------------------------- icon & status -------------------------------
-def make_icon(active=False):
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+def make_icon(active=False, size=64):
+    """Beamed eighth-notes glyph; blue when idle, green while streaming."""
+    s = size
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     c = (40, 200, 90) if active else (60, 160, 230)
-    d.rectangle([14, 24, 26, 40], fill=c)
-    d.polygon([(26, 24), (40, 14), (40, 50), (26, 40)], fill=c)
-    for r in (10, 18):
-        d.arc([40 - r // 2, 32 - r, 40 + r + 6, 32 + r], start=-55, end=55, fill=c, width=4)
+    d.rectangle([0.28 * s, 0.14 * s, 0.80 * s, 0.27 * s], fill=c)   # beam
+    d.rectangle([0.28 * s, 0.14 * s, 0.37 * s, 0.72 * s], fill=c)   # left stem
+    d.rectangle([0.71 * s, 0.14 * s, 0.80 * s, 0.72 * s], fill=c)   # right stem
+    d.ellipse([0.10 * s, 0.62 * s, 0.41 * s, 0.84 * s], fill=c)     # left head
+    d.ellipse([0.53 * s, 0.62 * s, 0.84 * s, 0.84 * s], fill=c)     # right head
     return img
 
 
