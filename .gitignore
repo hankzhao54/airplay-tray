@@ -1,0 +1,14 @@
+# local environment / build output
+venv/
+build/
+dist/
+__pycache__/
+*.spec
+*.log
+*.zip
+
+# local-only files (personal setup, test audio)
+NOTES.local.md
+stream_live.py
+Stream to *.bat
+*.wav
