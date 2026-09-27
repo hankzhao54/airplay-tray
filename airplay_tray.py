@@ -34,13 +34,13 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 REPO_URL = "https://github.com/bleidzen/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
 # advertise latencyMin=11025 frames (0.25s), so lower values usually work.
-LATENCY_PRESETS = [(100, "Experimental (0.1s)"),
-                   (250, "Ultra low (0.25s)"), (500, "Low (0.5s)"),
+LATENCY_PRESETS = [(100, "Experimental (0.1s)"), (150, "Very low (0.15s)"),
+                   (200, "Lower (0.2s)"), (250, "Ultra low (0.25s)"), (500, "Low (0.5s)"),
                    (1000, "Normal (1s)"), (1500, "Safe (1.5s, pyatv default)")]
 DEFAULT_LATENCY_MS = 500
 _latency_ms = DEFAULT_LATENCY_MS
@@ -138,10 +138,8 @@ class LivePCMSource(AudioSource):
                     pcm = np.clip(data * 32767.0, -32768, 32767).astype(">i2").tobytes()
                     with self._lock:
                         self._buf.extend(pcm)
-                        # bound capture-side backlog (clock drift / stalls) so it
-                        # never eats a big share of the AirPlay buffer
-                        secs = min(0.12, max(0.04, _latency_ms / 2000))
-                        cap = int(self._sr * self._ch * self._ss * secs)
+                        # safety cap only; readframes() keeps the real target
+                        cap = int(self._sr * self._ch * self._ss * 0.5)
                         if len(self._buf) > cap:
                             del self._buf[:len(self._buf) - cap]
                     self._loop.call_soon_threadsafe(self._ev.set)
@@ -150,25 +148,58 @@ class LivePCMSource(AudioSource):
             self._stopped = True
             self._loop.call_soon_threadsafe(self._ev.set)
 
+    # Small jitter buffer between WASAPI (bursty, own clock) and pyatv (paced
+    # by the wall clock). readframes() never blocks while streaming: blocking
+    # would stall pyatv's pacing so packets reach the speaker late, which is
+    # audible as stutter once the AirPlay buffer is small. Underruns are
+    # padded with silence and the buffer re-primes; excess from clock drift
+    # is trimmed back to the target.
+    PREFILL_S = 0.03
+    MAX_EXTRA_S = 0.06
+
+    def _bytes(self, secs):
+        fs = self._ch * self._ss
+        return int(self._sr * secs) * fs
+
     async def readframes(self, nframes):
         need = nframes * self._ss * self._ch
-        while True:
-            with self._lock:
-                have = len(self._buf)
-            if have >= need or self._stopped:
-                break
-            self._ev.clear()
-            with self._lock:
-                if len(self._buf) >= need:
-                    break
-            try:
-                await asyncio.wait_for(self._ev.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
+        if not hasattr(self, "_primed"):
+            self._primed = False
+            self._underruns = 0
+            self._trims = 0
+            self._last_stat = time.monotonic()
+        target = self._bytes(self.PREFILL_S)
+        high = target + self._bytes(self.MAX_EXTRA_S)
         with self._lock:
-            n = min(need, len(self._buf))
-            data = bytes(self._buf[:n])
-            del self._buf[:n]
+            have = len(self._buf)
+            if self._stopped:
+                data = bytes(self._buf[:need])
+                del self._buf[:need]
+                return data          # b"" ends the stream
+            if not self._primed:
+                if have >= target:
+                    self._primed = True
+                else:
+                    return bytes(need)
+            if have > high:
+                del self._buf[:have - target]
+                self._trims += 1
+                have = target
+            if have >= need:
+                data = bytes(self._buf[:need])
+                del self._buf[:need]
+            else:
+                data = bytes(self._buf) + bytes(need - have)
+                self._buf.clear()
+                self._primed = False
+                self._underruns += 1
+        now = time.monotonic()
+        if now - self._last_stat > 30:
+            if self._underruns or self._trims:
+                log.info("jitter buffer: %d underruns, %d trims in last %.0fs",
+                         self._underruns, self._trims, now - self._last_stat)
+            self._underruns = self._trims = 0
+            self._last_stat = now
         return data
 
     async def close(self):
@@ -802,6 +833,12 @@ def main():
             pass
         return
     log.info("starting %s v%s", APP_NAME, APP_VERSION)
+    try:
+        # 1ms timer resolution: pyatv paces packets every ~8ms with
+        # asyncio.sleep, which is otherwise quantised to ~15.6ms on Windows
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        log.warning("timeBeginPeriod failed", exc_info=True)
     icon_holder = {}
     icon_state = {"active": None}
 
