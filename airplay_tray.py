@@ -34,7 +34,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -118,6 +118,8 @@ class LivePCMSource(AudioSource):
         self._stopped = False
         self._loop = asyncio.get_running_loop()
         self._ev = asyncio.Event()
+        self.cap_chunks = 0
+        self.cap_silent = 0
         threading.Thread(target=self._capture, daemon=True, name="capture").start()
 
     def _capture(self):
@@ -132,8 +134,18 @@ class LivePCMSource(AudioSource):
             with mic.recorder(samplerate=self._sr, channels=self._ch) as rec:
                 # ~10ms chunks keep capture->send latency small
                 chunk = max(256, self._sr // 100)
+                t0 = time.monotonic()
+                heard = False
                 while not self._stopped:
                     data = rec.record(numframes=chunk)
+                    peak = float(np.abs(data).max()) if data.size else 0.0
+                    self.cap_chunks += 1
+                    if peak < 1e-4:
+                        self.cap_silent += 1
+                    elif not heard:
+                        heard = True
+                        log.info("capture: first audio after %.1fs",
+                                 time.monotonic() - t0)
                     # float32 [-1,1] -> big-endian s16 (what pyatv puts on the wire)
                     pcm = np.clip(data * 32767.0, -32768, 32767).astype(">i2").tobytes()
                     with self._lock:
@@ -195,10 +207,11 @@ class LivePCMSource(AudioSource):
                 self._underruns += 1
         now = time.monotonic()
         if now - self._last_stat > 30:
-            if self._underruns or self._trims:
-                log.info("jitter buffer: %d underruns, %d trims in last %.0fs",
-                         self._underruns, self._trims, now - self._last_stat)
+            log.info("last %.0fs: %d underruns, %d trims, capture %d/%d chunks "
+                     "silent", now - self._last_stat, self._underruns,
+                     self._trims, self.cap_silent, self.cap_chunks)
             self._underruns = self._trims = 0
+            self.cap_chunks = self.cap_silent = 0
             self._last_stat = now
         return data
 
@@ -345,6 +358,7 @@ class Streamer:
         self.mute_local = bool(cfg.get("mute_local", True))
         self.muter = LocalMuter()
         self._muted_flag = False
+        self._restarting = False
         if cfg.get("muted_by_us"):
             # last run ended (crash?) while it had the PC muted - undo that
             self.muter.force_unmute()
@@ -366,7 +380,7 @@ class Streamer:
             log.exception("on_change failed")
 
     def _sync_mute(self):
-        want = self.mute_local and bool(self.sessions)
+        want = self.mute_local and (bool(self.sessions) or self._restarting)
         if want and not self._muted_flag:
             self._muted_flag = True
             self.muter.mute()
@@ -487,12 +501,19 @@ class Streamer:
             return
 
         async def restart():
-            for ident, _ in active:
-                await self._stop_session(ident, remember=False)
-            self._notify()
-            await asyncio.sleep(1.0)   # speakers dislike instant re-SETUP
-            for ident, name in active:
-                await self._start_session(ident, name)
+            # stay muted through the reconnect so the PC doesn't blip
+            self._restarting = True
+            try:
+                for ident, _ in active:
+                    await self._stop_session(ident, remember=False)
+                self._notify()
+                # speakers dislike an instant re-SETUP (seen: 6s connects)
+                await asyncio.sleep(2.5)
+                for ident, name in active:
+                    await self._start_session(ident, name)
+            finally:
+                self._restarting = False
+                self._notify()
         self._submit(restart())
 
     def toggle_resume(self):
@@ -579,8 +600,9 @@ class Streamer:
             sess.task = asyncio.ensure_future(atv.stream.stream_file("live"))
             sess.task.add_done_callback(lambda f, i=ident: self._sess_done(i, f))
             sess.state = "Streaming"
+            log.info("streaming to %s (latency %dms, connect took %.1fs)", name,
+                     self.latency_ms, time.monotonic() - sess.started)
             sess.started = time.monotonic()
-            log.info("streaming to %s (latency %dms)", name, self.latency_ms)
             self._remember_last()
             self._notify()
         except Exception:
