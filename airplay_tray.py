@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 import webbrowser
 
 import numpy as np
@@ -34,7 +35,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -50,6 +51,8 @@ LOGPATH = os.path.join(os.environ.get("TEMP", "."), "airplay_tray.log")
 
 logging.basicConfig(filename=LOGPATH, level=logging.INFO, filemode="w",
                     format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+if "--debug" in sys.argv:          # verbose pyatv protocol logging
+    logging.getLogger("pyatv").setLevel(logging.DEBUG)
 log = logging.getLogger("tray")
 sys.excepthook = lambda *a: log.error("uncaught exception", exc_info=a)
 if hasattr(threading, "excepthook"):
@@ -63,6 +66,7 @@ def _latency_frames(sample_rate):
     return max(704, int(sample_rate * _latency_ms / 1000))
 
 
+_live_contexts = weakref.WeakSet()   # contexts of running streams
 _orig_ctx_init = StreamContext.__init__
 _orig_ctx_reset = StreamContext.reset
 
@@ -70,6 +74,7 @@ _orig_ctx_reset = StreamContext.reset
 def _ctx_init(self, *a, **kw):
     _orig_ctx_init(self, *a, **kw)
     self.latency = _latency_frames(self.sample_rate)
+    _live_contexts.add(self)
 
 
 def _ctx_reset(self, *a, **kw):
@@ -89,8 +94,11 @@ async def _rtsp_setup(self, headers=None, body=None):
     if isinstance(body, dict):
         for st in body.get("streams", []) or []:
             if isinstance(st, dict) and "latencyMin" in st:
+                # announce the lowest preset so latency can later be lowered
+                # live without a new SETUP
+                sr = st.get("sr", 44100)
                 st["latencyMin"] = min(st["latencyMin"],
-                                       _latency_frames(st.get("sr", 44100)))
+                                       max(704, sr * LATENCY_PRESETS[0][0] // 1000))
     return await _orig_rtsp_setup(self, headers=headers, body=body)
 
 
@@ -98,8 +106,14 @@ RtspSession.setup = _rtsp_setup
 
 
 def set_latency_ms(ms):
+    """Set latency; running streams pick it up with their next sync packet."""
     global _latency_ms
     _latency_ms = int(ms)
+    for ctx in list(_live_contexts):
+        try:
+            ctx.latency = _latency_frames(ctx.sample_rate)
+        except Exception:
+            pass
 
 
 # ----------------------------- audio source --------------------------------
@@ -358,7 +372,7 @@ class Streamer:
         self.mute_local = bool(cfg.get("mute_local", True))
         self.muter = LocalMuter()
         self._muted_flag = False
-        self._restarting = False
+        self._restarting = False    # kept for mute logic
         if cfg.get("muted_by_us"):
             # last run ended (crash?) while it had the PC muted - undo that
             self.muter.force_unmute()
@@ -488,7 +502,7 @@ class Streamer:
             self._submit(apply())
 
     def set_latency(self, ms):
-        """Change receiver buffer; restarts active streams so it takes effect."""
+        """Change receiver buffer on the fly (no reconnect)."""
         if int(ms) == self.latency_ms:
             return
         log.info("latency -> %dms", ms)
@@ -496,25 +510,10 @@ class Streamer:
         set_latency_ms(ms)
         self._save_config()
         self._notify()
-        active = [(s.ident, s.name) for s in list(self.sessions.values())]
-        if not active:
-            return
-
-        async def restart():
-            # stay muted through the reconnect so the PC doesn't blip
-            self._restarting = True
-            try:
-                for ident, _ in active:
-                    await self._stop_session(ident, remember=False)
-                self._notify()
-                # speakers dislike an instant re-SETUP (seen: 6s connects)
-                await asyncio.sleep(2.5)
-                for ident, name in active:
-                    await self._start_session(ident, name)
-            finally:
-                self._restarting = False
-                self._notify()
-        self._submit(restart())
+        # Applied live: pyatv reads context.latency for every sync packet
+        # (sent each second), so the speaker re-times playback without a
+        # reconnect. Reconnecting made some speakers go silent for 5-10s.
+        log.info("latency applied live to %d stream(s)", len(self.sessions))
 
     def toggle_resume(self):
         self.resume = not self.resume
