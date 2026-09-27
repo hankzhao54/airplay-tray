@@ -3,3 +3,4 @@ soundcard>=0.4.6
 numpy>=1.26
 pystray>=0.19.5
 Pillow>=10.0
+pycaw>=20230407

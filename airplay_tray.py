@@ -9,6 +9,8 @@ speakers run as independent streams, so they may drift slightly out of sync
 Logs to %TEMP%\\airplay_tray.log. Build a standalone exe with build_exe.ps1.
 """
 import asyncio
+import atexit
+import concurrent.futures
 import ctypes
 import json
 import logging
@@ -24,6 +26,7 @@ import pyatv
 import pyatv.protocols.raop as raop_pkg
 from pyatv.const import Protocol
 from pyatv.protocols.raop.protocols import StreamContext
+from pyatv.support.rtsp import RtspSession
 from pyatv.protocols.raop.audio_source import AudioSource
 from pyatv.support.metadata import EMPTY_METADATA
 
@@ -31,12 +34,13 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 REPO_URL = "https://github.com/bleidzen/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
 # advertise latencyMin=11025 frames (0.25s), so lower values usually work.
-LATENCY_PRESETS = [(250, "Ultra low (0.25s)"), (500, "Low (0.5s)"),
+LATENCY_PRESETS = [(100, "Experimental (0.1s)"),
+                   (250, "Ultra low (0.25s)"), (500, "Low (0.5s)"),
                    (1000, "Normal (1s)"), (1500, "Safe (1.5s, pyatv default)")]
 DEFAULT_LATENCY_MS = 500
 _latency_ms = DEFAULT_LATENCY_MS
@@ -55,7 +59,8 @@ if hasattr(threading, "excepthook"):
 
 # ----------------------------- latency patch --------------------------------
 def _latency_frames(sample_rate):
-    return max(11025 * sample_rate // 44100, int(sample_rate * _latency_ms / 1000))
+    # floor: two RTP packets (352 frames each)
+    return max(704, int(sample_rate * _latency_ms / 1000))
 
 
 _orig_ctx_init = StreamContext.__init__
@@ -74,6 +79,22 @@ def _ctx_reset(self, *a, **kw):
 
 StreamContext.__init__ = _ctx_init
 StreamContext.reset = _ctx_reset
+
+# AirPlay 2 SETUP tells the receiver latencyMin=11025 (0.25s); lower it when the
+# user picks something smaller so the speaker is allowed to buffer less.
+_orig_rtsp_setup = RtspSession.setup
+
+
+async def _rtsp_setup(self, headers=None, body=None):
+    if isinstance(body, dict):
+        for st in body.get("streams", []) or []:
+            if isinstance(st, dict) and "latencyMin" in st:
+                st["latencyMin"] = min(st["latencyMin"],
+                                       _latency_frames(st.get("sr", 44100)))
+    return await _orig_rtsp_setup(self, headers=headers, body=body)
+
+
+RtspSession.setup = _rtsp_setup
 
 
 def set_latency_ms(ms):
@@ -117,9 +138,10 @@ class LivePCMSource(AudioSource):
                     pcm = np.clip(data * 32767.0, -32768, 32767).astype(">i2").tobytes()
                     with self._lock:
                         self._buf.extend(pcm)
-                        # bound capture-side backlog (clock drift / stalls) to
-                        # ~120ms so it never adds up on top of the AirPlay buffer
-                        cap = int(self._sr * self._ch * self._ss * 0.12)
+                        # bound capture-side backlog (clock drift / stalls) so it
+                        # never eats a big share of the AirPlay buffer
+                        secs = min(0.12, max(0.04, _latency_ms / 2000))
+                        cap = int(self._sr * self._ch * self._ss * secs)
                         if len(self._buf) > cap:
                             del self._buf[:len(self._buf) - cap]
                     self._loop.call_soon_threadsafe(self._ev.set)
@@ -173,6 +195,86 @@ class LivePCMSource(AudioSource):
         return 0
 
 
+# ----------------------------- local mute ----------------------------------
+class LocalMuter:
+    """Mutes the PC's default output while streaming, restores it afterwards.
+
+    WASAPI loopback captures before the endpoint mute, so the AirPlay speakers
+    keep playing while headphones/PC speakers go quiet. All COM calls run on
+    one dedicated thread.
+    """
+
+    def __init__(self):
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="com", initializer=self._com_init)
+        self._ev = None          # endpoint we muted
+        self._prev = None        # its mute state before we touched it
+
+    @staticmethod
+    def _com_init():
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            log.exception("CoInitialize failed")
+
+    @staticmethod
+    def _endpoint():
+        import comtypes
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        dev = AudioUtilities.GetSpeakers()
+        ev = getattr(dev, "EndpointVolume", None)
+        if ev is None:   # older pycaw returns a raw IMMDevice
+            iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+            ev = iface.QueryInterface(IAudioEndpointVolume)
+        return ev
+
+    def _mute(self):
+        if self._ev is not None:
+            return
+        try:
+            ev = self._endpoint()
+            self._prev = bool(ev.GetMute())
+            if not self._prev:
+                ev.SetMute(1, None)
+            self._ev = ev
+            log.info("local output muted (was muted: %s)", self._prev)
+        except Exception:
+            log.exception("local mute failed")
+
+    def _restore(self):
+        if self._ev is None:
+            return
+        try:
+            if not self._prev:
+                self._ev.SetMute(0, None)
+            log.info("local output restored")
+        except Exception:
+            log.exception("local unmute failed")
+        self._ev = None
+        self._prev = None
+
+    def _force_unmute(self):
+        try:
+            self._endpoint().SetMute(0, None)
+            log.info("unmuted output left muted by a previous run")
+        except Exception:
+            log.exception("recovery unmute failed")
+
+    def mute(self):
+        return self._pool.submit(self._mute)
+
+    def restore(self):
+        return self._pool.submit(self._restore)
+
+    def force_unmute(self):
+        return self._pool.submit(self._force_unmute)
+
+    @property
+    def muted(self):
+        return self._ev is not None
+
+
 # ----------------------------- controller ----------------------------------
 class Session:
     def __init__(self, ident, name):
@@ -209,6 +311,13 @@ class Streamer:
         self.resume = bool(cfg.get("resume", False))
         self.latency_ms = int(cfg.get("latency_ms", DEFAULT_LATENCY_MS))
         set_latency_ms(self.latency_ms)
+        self.mute_local = bool(cfg.get("mute_local", True))
+        self.muter = LocalMuter()
+        self._muted_flag = False
+        if cfg.get("muted_by_us"):
+            # last run ended (crash?) while it had the PC muted - undo that
+            self.muter.force_unmute()
+            self._save_config()
         raop_pkg.open_source = self._open_source
 
     def _run(self):
@@ -219,10 +328,36 @@ class Streamer:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     def _notify(self):
+        self._sync_mute()
         try:
             self.on_change()
         except Exception:
             log.exception("on_change failed")
+
+    def _sync_mute(self):
+        want = self.mute_local and bool(self.sessions)
+        if want and not self._muted_flag:
+            self._muted_flag = True
+            self.muter.mute()
+            self._save_config()
+        elif not want and self._muted_flag:
+            self._muted_flag = False
+            self.muter.restore()
+            self._save_config()
+
+    def toggle_mute_local(self):
+        self.mute_local = not self.mute_local
+        self._save_config()
+        self._notify()
+
+    def shutdown_mute(self):
+        """Blocking restore used at quit."""
+        self._muted_flag = False
+        try:
+            self.muter.restore().result(timeout=3)
+        except Exception:
+            log.exception("restore on quit failed")
+        self._save_config()
 
     def _error(self, msg):
         log.error(msg)
@@ -235,7 +370,9 @@ class Streamer:
         save_config({"volumes": self.volumes,
                      "last": [list(x) for x in self.last],
                      "resume": self.resume,
-                     "latency_ms": self.latency_ms})
+                     "latency_ms": self.latency_ms,
+                     "mute_local": self.mute_local,
+                     "muted_by_us": self._muted_flag})
 
     async def _open_source(self, file, sr, ch, ss):
         src = LivePCMSource(sr, ch, ss)
@@ -623,6 +760,10 @@ def build_menu(streamer, on_rescan, on_quit):
             yield pystray.MenuItem("Volume", _volume_root(streamer))
         yield pystray.MenuItem("Latency", _latency_menu(streamer))
         yield pystray.MenuItem(
+            "Mute this PC while streaming",
+            lambda icon, item: streamer.toggle_mute_local(),
+            checked=lambda item: streamer.mute_local)
+        yield pystray.MenuItem(
             "Stop all", lambda icon, item: streamer.stop_all(),
             enabled=lambda item: bool(streamer.sessions))
         yield pystray.MenuItem("Rescan speakers", on_rescan)
@@ -689,6 +830,7 @@ def main():
                 log.exception("notify failed")
 
     streamer = Streamer(on_change=on_change, on_error=on_error)
+    atexit.register(streamer.shutdown_mute)
 
     def on_rescan(icon, item):
         streamer.scan()
@@ -699,6 +841,7 @@ def main():
             streamer.stop_all(remember=False).result(timeout=8)
         except BaseException:
             log.exception("teardown on quit incomplete")
+        streamer.shutdown_mute()
         icon.stop()
 
     icon = pystray.Icon(APP_NAME, make_icon(False), APP_NAME,

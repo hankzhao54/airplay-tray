@@ -24,7 +24,8 @@ performs the pairing — so those speakers just work.
 - Auto-discovers AirPlay / AirPlay 2 receivers on your network (Bonjour not required)
 - Stream to **multiple speakers at once**
 - **Per-speaker volume** control from the menu
-- **Adjustable latency** — down to ~0.25s (v0.2 was ~2s)
+- **Adjustable latency** — down to ~0.1s experimental (v0.2 was ~2s)
+- **Mutes your PC/headphones while streaming** (restored when you stop)
 - Remembers volumes, and can optionally **resume your last speakers on launch**
 - Auto-retries flaky connections once before complaining, with clear
   notifications when something is actually wrong
@@ -58,7 +59,8 @@ Good to know:
 - It streams your **default output device** — whatever Windows plays. If you
   switch output device, stop and start the speaker again.
 - **Latency** menu sets how much the speaker buffers: *Low (0.5s)* by default,
-  *Ultra low (0.25s)* if your Wi-Fi is solid, *Safe (1.5s)* if you hear
+  *Ultra low (0.25s)* if your Wi-Fi is solid, *Experimental (0.1s)* if your
+  speaker accepts it, *Safe (1.5s)* if you hear
   dropouts. AirPlay can't do zero latency, so for video use your player's
   audio-delay setting to line things up.
 - Multiple speakers run as independent streams, so they can drift slightly

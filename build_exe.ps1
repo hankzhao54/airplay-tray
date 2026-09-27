@@ -13,6 +13,8 @@ $mode = if ($Console) { '--console' } else { '--windowed' }
   --collect-all zeroconf `
   --collect-all soundcard `
   --collect-all pystray `
+  --collect-all pycaw `
+  --collect-all comtypes `
   --collect-all pydantic `
   --collect-submodules pyatv `
   --distpath (Join-Path $root 'dist') --workpath (Join-Path $root 'build') --specpath $root `
