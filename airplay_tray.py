@@ -35,7 +35,7 @@ import pystray
 
 APP_NAME = "AirPlay Tray"
 APP_VERSION = "0.4.1"
-REPO_URL = "https://github.com/bleidzen/airplay-tray"
+REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
 # advertise latencyMin=11025 frames (0.25s), so lower values usually work.

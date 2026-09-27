@@ -1,5 +1,7 @@
 # AirPlay Tray
 
+> Fork of [bleidzen/airplay-tray](https://github.com/bleidzen/airplay-tray) with low-latency streaming (down to ~0.1s) and automatic local muting while streaming.
+
 Stream your Windows PC's audio to AirPlay speakers, straight from the system
 tray — **including AirPlay 2 speakers that require pairing**, which the classic
 Windows tools can't connect to.
@@ -34,7 +36,7 @@ performs the pairing — so those speakers just work.
 ## Download
 
 Grab `AirPlayTray.zip` from the
-[latest release](https://github.com/bleidzen/airplay-tray/releases/latest),
+[latest release](https://github.com/hankzhao54/airplay-tray/releases/latest),
 unzip, and run `AirPlayTray.exe`.
 
 Two things on first run (the exe is not code-signed):
