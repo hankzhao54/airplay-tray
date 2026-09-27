@@ -23,6 +23,7 @@ import soundcard as sc
 import pyatv
 import pyatv.protocols.raop as raop_pkg
 from pyatv.const import Protocol
+from pyatv.protocols.raop.protocols import StreamContext
 from pyatv.protocols.raop.audio_source import AudioSource
 from pyatv.support.metadata import EMPTY_METADATA
 
@@ -30,9 +31,15 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 REPO_URL = "https://github.com/bleidzen/airplay-tray"
 DEFAULT_VOLUME = 30
+# Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
+# advertise latencyMin=11025 frames (0.25s), so lower values usually work.
+LATENCY_PRESETS = [(250, "Ultra low (0.25s)"), (500, "Low (0.5s)"),
+                   (1000, "Normal (1s)"), (1500, "Safe (1.5s, pyatv default)")]
+DEFAULT_LATENCY_MS = 500
+_latency_ms = DEFAULT_LATENCY_MS
 CONFIG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                       "AirPlayTray", "config.json")
 LOGPATH = os.path.join(os.environ.get("TEMP", "."), "airplay_tray.log")
@@ -44,6 +51,34 @@ sys.excepthook = lambda *a: log.error("uncaught exception", exc_info=a)
 if hasattr(threading, "excepthook"):
     threading.excepthook = lambda a: log.error(
         "thread exception", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+
+
+# ----------------------------- latency patch --------------------------------
+def _latency_frames(sample_rate):
+    return max(11025 * sample_rate // 44100, int(sample_rate * _latency_ms / 1000))
+
+
+_orig_ctx_init = StreamContext.__init__
+_orig_ctx_reset = StreamContext.reset
+
+
+def _ctx_init(self, *a, **kw):
+    _orig_ctx_init(self, *a, **kw)
+    self.latency = _latency_frames(self.sample_rate)
+
+
+def _ctx_reset(self, *a, **kw):
+    _orig_ctx_reset(self, *a, **kw)
+    self.latency = _latency_frames(self.sample_rate)
+
+
+StreamContext.__init__ = _ctx_init
+StreamContext.reset = _ctx_reset
+
+
+def set_latency_ms(ms):
+    global _latency_ms
+    _latency_ms = int(ms)
 
 
 # ----------------------------- audio source --------------------------------
@@ -74,14 +109,17 @@ class LivePCMSource(AudioSource):
                            if getattr(m, "isloopback", False))
             log.info("capturing loopback of %s @ %sHz x%s", spk.name, self._sr, self._ch)
             with mic.recorder(samplerate=self._sr, channels=self._ch) as rec:
+                # ~10ms chunks keep capture->send latency small
+                chunk = max(256, self._sr // 100)
                 while not self._stopped:
-                    data = rec.record(numframes=2048)
+                    data = rec.record(numframes=chunk)
                     # float32 [-1,1] -> big-endian s16 (what pyatv puts on the wire)
                     pcm = np.clip(data * 32767.0, -32768, 32767).astype(">i2").tobytes()
                     with self._lock:
                         self._buf.extend(pcm)
-                        # bound capture latency to ~0.4s
-                        cap = int(self._sr * self._ch * self._ss * 0.4)
+                        # bound capture-side backlog (clock drift / stalls) to
+                        # ~120ms so it never adds up on top of the AirPlay buffer
+                        cap = int(self._sr * self._ch * self._ss * 0.12)
                         if len(self._buf) > cap:
                             del self._buf[:len(self._buf) - cap]
                     self._loop.call_soon_threadsafe(self._ev.set)
@@ -169,6 +207,8 @@ class Streamer:
         self.volumes = {str(k): int(v) for k, v in cfg.get("volumes", {}).items()}
         self.last = [tuple(x) for x in cfg.get("last", []) if len(x) == 2]
         self.resume = bool(cfg.get("resume", False))
+        self.latency_ms = int(cfg.get("latency_ms", DEFAULT_LATENCY_MS))
+        set_latency_ms(self.latency_ms)
         raop_pkg.open_source = self._open_source
 
     def _run(self):
@@ -194,7 +234,8 @@ class Streamer:
     def _save_config(self):
         save_config({"volumes": self.volumes,
                      "last": [list(x) for x in self.last],
-                     "resume": self.resume})
+                     "resume": self.resume,
+                     "latency_ms": self.latency_ms})
 
     async def _open_source(self, file, sr, ch, ss):
         src = LivePCMSource(sr, ch, ss)
@@ -263,6 +304,28 @@ class Streamer:
                 except Exception:
                     log.warning("set_volume(%s) failed", vol, exc_info=True)
             self._submit(apply())
+
+    def set_latency(self, ms):
+        """Change receiver buffer; restarts active streams so it takes effect."""
+        if int(ms) == self.latency_ms:
+            return
+        log.info("latency -> %dms", ms)
+        self.latency_ms = int(ms)
+        set_latency_ms(ms)
+        self._save_config()
+        self._notify()
+        active = [(s.ident, s.name) for s in list(self.sessions.values())]
+        if not active:
+            return
+
+        async def restart():
+            for ident, _ in active:
+                await self._stop_session(ident, remember=False)
+            self._notify()
+            await asyncio.sleep(1.0)   # speakers dislike instant re-SETUP
+            for ident, name in active:
+                await self._start_session(ident, name)
+        self._submit(restart())
 
     def toggle_resume(self):
         self.resume = not self.resume
@@ -349,7 +412,7 @@ class Streamer:
             sess.task.add_done_callback(lambda f, i=ident: self._sess_done(i, f))
             sess.state = "Streaming"
             sess.started = time.monotonic()
-            log.info("streaming to %s", name)
+            log.info("streaming to %s (latency %dms)", name, self.latency_ms)
             self._remember_last()
             self._notify()
         except Exception:
@@ -531,6 +594,16 @@ def _volume_root(streamer):
     return pystray.Menu(gen)
 
 
+def _latency_menu(streamer):
+    def gen():
+        for ms, label in LATENCY_PRESETS:
+            yield pystray.MenuItem(
+                label, (lambda m: lambda icon, item: streamer.set_latency(m))(ms),
+                checked=(lambda m: lambda item: streamer.latency_ms == m)(ms),
+                radio=True)
+    return pystray.Menu(gen)
+
+
 def build_menu(streamer, on_rescan, on_quit):
     def items():
         yield pystray.MenuItem(status_text(streamer), None, enabled=False)
@@ -548,6 +621,7 @@ def build_menu(streamer, on_rescan, on_quit):
         yield pystray.Menu.SEPARATOR
         if devs:
             yield pystray.MenuItem("Volume", _volume_root(streamer))
+        yield pystray.MenuItem("Latency", _latency_menu(streamer))
         yield pystray.MenuItem(
             "Stop all", lambda icon, item: streamer.stop_all(),
             enabled=lambda item: bool(streamer.sessions))
