@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -51,8 +51,49 @@ LOGPATH = os.path.join(os.environ.get("TEMP", "."), "airplay_tray.log")
 
 logging.basicConfig(filename=LOGPATH, level=logging.INFO, filemode="w",
                     format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
-if "--debug" in sys.argv:          # verbose pyatv protocol logging
+if "--debug" in sys.argv:          # verbose pyatv protocol logging (heavy!)
     logging.getLogger("pyatv").setLevel(logging.DEBUG)
+
+
+class _NetStats(logging.Handler):
+    """Counts pyatv stream-client events without writing them anywhere.
+
+    late    - "Compensating": pyatv sent a packet late and is catching up (PC side)
+    slow    - "Too slow to keep up" (PC side, worse)
+    resend  - speaker asked for a retransmit => packet lost on the network
+    missed  - retransmit asked for a packet no longer in backlog (audible)
+    """
+
+    KEYS = {"Compensating": "late", "Too slow": "slow",
+            "%s from %s": "resend", "not in backlog": "missed"}
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.counts = dict.fromkeys(self.KEYS.values(), 0)
+
+    def emit(self, record):
+        msg = record.msg if isinstance(record.msg, str) else ""
+        for key, name in self.KEYS.items():
+            if key in msg:
+                self.counts[name] += 1
+                return
+
+    def take(self):
+        c, self.counts = self.counts, dict.fromkeys(self.KEYS.values(), 0)
+        return c
+
+
+NETSTATS = _NetStats()
+if "--debug" not in sys.argv:
+    _sc_log = logging.getLogger("pyatv.protocols.raop.stream_client")
+    _sc_log.setLevel(logging.DEBUG)
+    _sc_log.propagate = False            # don't write debug lines to the file
+    _sc_log.addHandler(NETSTATS)
+    _warn = logging.FileHandler(LOGPATH, encoding="utf-8")
+    _warn.setLevel(logging.WARNING)      # still log real warnings/errors
+    _warn.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    _sc_log.addHandler(_warn)
 log = logging.getLogger("tray")
 sys.excepthook = lambda *a: log.error("uncaught exception", exc_info=a)
 if hasattr(threading, "excepthook"):
@@ -221,9 +262,13 @@ class LivePCMSource(AudioSource):
                 self._underruns += 1
         now = time.monotonic()
         if now - self._last_stat > 30:
+            n = NETSTATS.take()
             log.info("last %.0fs: %d underruns, %d trims, capture %d/%d chunks "
-                     "silent", now - self._last_stat, self._underruns,
-                     self._trims, self.cap_silent, self.cap_chunks)
+                     "silent | send late %d, too slow %d | speaker resend "
+                     "requests %d, unrecoverable %d (latency %dms)",
+                     now - self._last_stat, self._underruns, self._trims,
+                     self.cap_silent, self.cap_chunks, n["late"], n["slow"],
+                     n["resend"], n["missed"], _latency_ms)
             self._underruns = self._trims = 0
             self.cap_chunks = self.cap_silent = 0
             self._last_stat = now
