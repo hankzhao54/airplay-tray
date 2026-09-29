@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -147,14 +147,26 @@ RtspSession.setup = _rtsp_setup
 
 
 def set_latency_ms(ms):
-    """Set latency; running streams pick it up with their next sync packet."""
+    """Set latency; running streams are re-timed without a reconnect.
+
+    Audio packets carry rtptime = head_ts - start_ts + latency, and sync
+    packets map position (head_ts - start_ts) to the sender clock. Changing
+    only `latency` makes packet timestamps jump (backwards when lowering),
+    which confused a HomePod mini into silently dropping the stream. Shifting
+    start_ts by the same delta keeps packet timestamps continuous and moves
+    only the sync mapping - the same kind of correction a receiver does for
+    normal clock drift (lowering skips delta of audio, raising adds a gap).
+    """
     global _latency_ms
     _latency_ms = int(ms)
     for ctx in list(_live_contexts):
         try:
-            ctx.latency = _latency_frames(ctx.sample_rate)
+            delta = _latency_frames(ctx.sample_rate) - ctx.latency
+            if delta and ctx.start_ts:
+                ctx.start_ts += delta
+            ctx.latency += delta
         except Exception:
-            pass
+            log.warning("live latency change failed", exc_info=True)
 
 
 # ----------------------------- audio source --------------------------------
@@ -235,7 +247,9 @@ class LivePCMSource(AudioSource):
             self._underruns = 0
             self._trims = 0
             self._last_stat = time.monotonic()
-        target = self._bytes(self.PREFILL_S)
+        # scale the local cushion with the AirPlay buffer: more room for WASAPI
+        # hiccups when latency allows it (30ms at <=0.12s .. 80ms at >=0.32s)
+        target = self._bytes(min(0.08, max(self.PREFILL_S, _latency_ms / 4000)))
         high = target + self._bytes(self.MAX_EXTRA_S)
         with self._lock:
             have = len(self._buf)
