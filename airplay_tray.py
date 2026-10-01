@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -70,12 +70,14 @@ class _NetStats(logging.Handler):
     def __init__(self):
         super().__init__(logging.DEBUG)
         self.counts = dict.fromkeys(self.KEYS.values(), 0)
+        self.total = dict.fromkeys(self.KEYS.values(), 0)   # never reset
 
     def emit(self, record):
         msg = record.msg if isinstance(record.msg, str) else ""
         for key, name in self.KEYS.items():
             if key in msg:
                 self.counts[name] += 1
+                self.total[name] += 1
                 return
 
     def take(self):
@@ -428,6 +430,10 @@ class Streamer:
         self.resume = bool(cfg.get("resume", False))
         self.latency_ms = int(cfg.get("latency_ms", DEFAULT_LATENCY_MS))
         set_latency_ms(self.latency_ms)
+        self.auto_latency = bool(cfg.get("auto_latency", True))
+        self.eff_ms = self.latency_ms       # what is actually applied
+        self.loop.call_soon_threadsafe(
+            lambda: self.loop.create_task(self._adapt_loop()))
         self.mute_local = bool(cfg.get("mute_local", True))
         self.muter = LocalMuter()
         self._muted_flag = False
@@ -490,6 +496,7 @@ class Streamer:
                      "resume": self.resume,
                      "latency_ms": self.latency_ms,
                      "mute_local": self.mute_local,
+                     "auto_latency": self.auto_latency,
                      "muted_by_us": self._muted_flag})
 
     async def _open_source(self, file, sr, ch, ss):
@@ -566,6 +573,7 @@ class Streamer:
             return
         log.info("latency -> %dms", ms)
         self.latency_ms = int(ms)
+        self.eff_ms = self.latency_ms
         set_latency_ms(ms)
         self._save_config()
         self._notify()
@@ -573,6 +581,57 @@ class Streamer:
         # (sent each second), so the speaker re-times playback without a
         # reconnect. Reconnecting made some speakers go silent for 5-10s.
         log.info("latency applied live to %d stream(s)", len(self.sessions))
+
+    # ---- adaptive latency ----
+    ADAPT_EVERY = 5          # s between checks
+    ADAPT_BAD = 10           # resend requests per check that count as bad Wi-Fi
+    ADAPT_CALM = 120         # s of calm before stepping back down
+    ADAPT_MAX = 1000         # ms ceiling for automatic raises
+
+    def toggle_auto_latency(self):
+        self.auto_latency = not self.auto_latency
+        if not self.auto_latency and self.eff_ms != self.latency_ms:
+            self.eff_ms = self.latency_ms
+            set_latency_ms(self.latency_ms)
+            log.info("auto latency off -> back to %dms", self.latency_ms)
+        self._save_config()
+        self._notify()
+
+    def _apply_eff(self, ms, why):
+        log.info("auto latency %dms -> %dms (%s)", self.eff_ms, ms, why)
+        self.eff_ms = ms
+        set_latency_ms(ms)
+        self._notify()
+
+    async def _adapt_loop(self):
+        """Raise latency while the speaker keeps asking for retransmits (lossy
+        Wi-Fi needs time for resends to arrive), step back down once calm."""
+        steps = sorted(ms for ms, _ in LATENCY_PRESETS)
+        prev = NETSTATS.total["resend"]
+        last_bad = 0.0
+        while True:
+            await asyncio.sleep(self.ADAPT_EVERY)
+            try:
+                cur = NETSTATS.total["resend"]
+                delta, prev = cur - prev, cur
+                if not self.sessions or not self.auto_latency:
+                    continue
+                now = time.monotonic()
+                if delta >= self.ADAPT_BAD:
+                    last_bad = now
+                    up = [m for m in steps if m > self.eff_ms and m <= self.ADAPT_MAX]
+                    if up:
+                        self._apply_eff(up[0], f"{delta} resend requests in "
+                                        f"{self.ADAPT_EVERY}s")
+                elif (self.eff_ms > self.latency_ms
+                      and now - last_bad > self.ADAPT_CALM):
+                    down = [m for m in steps
+                            if self.latency_ms <= m < self.eff_ms]
+                    self._apply_eff(down[-1] if down else self.latency_ms,
+                                    "Wi-Fi calm")
+                    last_bad = now - self.ADAPT_CALM + 30   # next step in 30s
+            except Exception:
+                log.exception("adapt loop error")
 
     def toggle_resume(self):
         self.resume = not self.resume
@@ -795,7 +854,10 @@ def make_icon(active=False, size=64):
 def status_text(streamer):
     names = streamer.active_names()
     if names:
-        return "Streaming -> " + ", ".join(names)
+        extra = ""
+        if streamer.eff_ms != streamer.latency_ms:
+            extra = f"  (latency raised to {streamer.eff_ms / 1000:g}s: weak Wi-Fi)"
+        return "Streaming -> " + ", ".join(names) + extra
     if streamer.any_connecting():
         return "Connecting..."
     return "Stopped (click a speaker)"
@@ -849,6 +911,11 @@ def _latency_menu(streamer):
                 label, (lambda m: lambda icon, item: streamer.set_latency(m))(ms),
                 checked=(lambda m: lambda item: streamer.latency_ms == m)(ms),
                 radio=True)
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem(
+            "Auto-raise when Wi-Fi is weak",
+            lambda icon, item: streamer.toggle_auto_latency(),
+            checked=lambda item: streamer.auto_latency)
     return pystray.Menu(gen)
 
 
