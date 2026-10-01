@@ -35,7 +35,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 APP_NAME = "AirPlay Tray"
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.7"
 REPO_URL = "https://github.com/hankzhao54/airplay-tray"
 DEFAULT_VOLUME = 30
 # Receiver-side playback buffer. pyatv hardcodes ~1.5s; AirPlay 2 receivers
@@ -45,6 +45,7 @@ LATENCY_PRESETS = [(100, "Experimental (0.1s)"), (150, "Very low (0.15s)"),
                    (1000, "Normal (1s)"), (1500, "Safe (1.5s, pyatv default)")]
 DEFAULT_LATENCY_MS = 500
 _latency_ms = DEFAULT_LATENCY_MS
+_base_latency_ms = DEFAULT_LATENCY_MS   # user's choice (announced at SETUP)
 CONFIG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                       "AirPlayTray", "config.json")
 LOGPATH = os.path.join(os.environ.get("TEMP", "."), "airplay_tray.log")
@@ -137,15 +138,24 @@ async def _rtsp_setup(self, headers=None, body=None):
     if isinstance(body, dict):
         for st in body.get("streams", []) or []:
             if isinstance(st, dict) and "latencyMin" in st:
-                # announce the lowest preset so latency can later be lowered
-                # live without a new SETUP
+                # Only go below pyatv's 0.25s when the user picked less. v0.4.3+
+                # always announced 0.1s; the HomePod seems to size its own
+                # receive buffer from this and then asks for retransmits on
+                # every small Wi-Fi delay, even with a long sync latency.
                 sr = st.get("sr", 44100)
                 st["latencyMin"] = min(st["latencyMin"],
-                                       max(704, sr * LATENCY_PRESETS[0][0] // 1000))
+                                       max(704, sr * _base_latency_ms // 1000))
+                log.info("SETUP latencyMin=%d frames (%.2fs)", st["latencyMin"],
+                         st["latencyMin"] / sr)
     return await _orig_rtsp_setup(self, headers=headers, body=body)
 
 
 RtspSession.setup = _rtsp_setup
+
+
+def set_base_latency_ms(ms):
+    global _base_latency_ms
+    _base_latency_ms = int(ms)
 
 
 def set_latency_ms(ms):
@@ -430,6 +440,7 @@ class Streamer:
         self.resume = bool(cfg.get("resume", False))
         self.latency_ms = int(cfg.get("latency_ms", DEFAULT_LATENCY_MS))
         set_latency_ms(self.latency_ms)
+        set_base_latency_ms(self.latency_ms)
         self.auto_latency = bool(cfg.get("auto_latency", True))
         self.eff_ms = self.latency_ms       # what is actually applied
         self.loop.call_soon_threadsafe(
@@ -575,6 +586,7 @@ class Streamer:
         self.latency_ms = int(ms)
         self.eff_ms = self.latency_ms
         set_latency_ms(ms)
+        set_base_latency_ms(ms)   # takes effect at the next connect
         self._save_config()
         self._notify()
         # Applied live: pyatv reads context.latency for every sync packet
